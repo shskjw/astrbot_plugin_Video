@@ -1,0 +1,5 @@
+name: astrbot_plugin_Video
+desc: openai格式视频生成插件，支持首尾帧，自然语言调用
+version: v1.0.0
+author: shskjw
+repo: https://github.com/shskjw/astrbot_plugin_Video

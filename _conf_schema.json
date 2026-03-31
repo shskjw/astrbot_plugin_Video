@@ -1,0 +1,140 @@
+{
+  "base_url": {
+    "description": "OpenAI 兼容接口地址",
+    "type": "string",
+    "hint": "例如 http://localhost:8000 ，插件会自动拼接 /v1/chat/completions",
+    "default": "http://localhost:8000"
+  },
+  "api_key": {
+    "description": "API 密钥",
+    "type": "string",
+    "hint": "请填写服务端要求的密钥，插件会自动以 Bearer 方式发送",
+    "default": ""
+  },
+  "model": {
+    "description": "统一使用的视频模型名",
+    "type": "string",
+    "hint": "文生视频、首尾帧生成视频、多图生成视频统一使用该模型",
+    "default": "veo_3_1_t2v_fast_landscape"
+  },
+  "timeout": {
+    "description": "请求超时时间（秒）",
+    "type": "int",
+    "hint": "用于控制视频生成接口的等待超时时间",
+    "default": 600
+  },
+  "max_images": {
+    "description": "多图生成最大图片数量",
+    "type": "int",
+    "hint": "多图生成视频允许上传的最大图片数",
+    "default": 6
+  },
+  "download_video": {
+    "description": "是否下载视频到本地后发送",
+    "type": "bool",
+    "hint": "关闭时优先直接发送链接，开启时会先尝试下载到本地",
+    "default": false
+  },
+  "send_video_as_url": {
+    "description": "是否优先发送视频链接",
+    "type": "bool",
+    "hint": "开启后优先发送视频链接，失败时再尝试其他方式",
+    "default": true
+  },
+  "prompt_list": {
+    "description": "视频预设列表",
+    "type": "list",
+    "hint": "格式为 触发词:完整提示词，例如：电影感: cinematic camera movement, dramatic lighting",
+    "default": []
+  },
+  "user_blacklist": {
+    "description": "用户黑名单",
+    "type": "list",
+    "hint": "黑名单中的用户无法使用视频生成功能",
+    "default": []
+  },
+  "group_blacklist": {
+    "description": "群组黑名单",
+    "type": "list",
+    "hint": "黑名单中的群无法使用视频生成功能",
+    "default": []
+  },
+  "user_whitelist": {
+    "description": "用户白名单",
+    "type": "list",
+    "hint": "若配置后，仅白名单用户可使用视频功能；管理员始终可用",
+    "default": []
+  },
+  "group_whitelist": {
+    "description": "群组白名单",
+    "type": "list",
+    "hint": "若配置后，仅白名单群组可使用视频功能",
+    "default": []
+  },
+  "enable_user_limit": {
+    "description": "是否启用用户次数限制",
+    "type": "bool",
+    "hint": "开启后每个用户都有独立剩余次数",
+    "default": true
+  },
+  "default_user_limit": {
+    "description": "新用户默认次数",
+    "type": "int",
+    "hint": "首次使用的用户默认拥有的可用次数",
+    "default": 10
+  },
+  "enable_group_limit": {
+    "description": "是否启用群组次数限制",
+    "type": "bool",
+    "hint": "开启后群组也会消耗自己的共享次数",
+    "default": false
+  },
+  "default_group_limit": {
+    "description": "新群组默认次数",
+    "type": "int",
+    "hint": "首次使用的群组默认拥有的可用次数",
+    "default": 50
+  },
+  "enable_checkin": {
+    "description": "是否启用签到获取次数",
+    "type": "bool",
+    "hint": "开启后用户可通过签到指令领取额外视频次数",
+    "default": false
+  },
+  "checkin_add_count": {
+    "description": "签到增加次数",
+    "type": "int",
+    "hint": "每次签到增加的用户视频次数",
+    "default": 3
+  },
+  "enable_context": {
+    "description": "是否启用视频上下文能力",
+    "type": "bool",
+    "hint": "开启后会记录最近几轮消息，用于补充视频生成提示词",
+    "default": true
+  },
+  "context_max_messages": {
+    "description": "上下文最大消息数",
+    "type": "int",
+    "hint": "每个会话最多保留多少条上下文消息",
+    "default": 20
+  },
+  "context_rounds": {
+    "description": "生成时引用的上下文轮数",
+    "type": "int",
+    "hint": "生成视频时最多附加多少条最近上下文摘要",
+    "default": 6
+  },
+  "enable_cooldown": {
+    "description": "是否启用冷却时间",
+    "type": "bool",
+    "hint": "开启后同一用户在冷却结束前不能再次提交视频任务",
+    "default": true
+  },
+  "cooldown_seconds": {
+    "description": "冷却时间（秒）",
+    "type": "int",
+    "hint": "同一用户两次视频任务提交之间的最小间隔秒数",
+    "default": 60
+  }
+}
