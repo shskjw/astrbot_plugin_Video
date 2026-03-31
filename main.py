@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
@@ -8,6 +9,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
+from context_repo import ContextRepo
 from exceptions import ConfigError, VideoPluginError
 from media_service import MediaService
 from message_service import MessageService
@@ -36,10 +38,16 @@ class VideoPlugin(Star):
         plugin_data_dir = self._get_plugin_data_dir()
         task_dir = plugin_data_dir / "tasks"
         usage_dir = plugin_data_dir / "usage"
+        context_dir = plugin_data_dir / "contexts"
 
         self.media_service = MediaService(timeout=min(self.plugin_config.timeout, 60))
         self.message_service = MessageService()
         self.task_repo = TaskRepo(task_dir)
+        self.context_repo = ContextRepo(
+            context_dir,
+            max_messages=self.plugin_config.context_max_messages,
+        )
+        self.cooldown_records: dict[str, datetime] = {}
         self.usage_repo = UsageRepo(
             usage_dir,
             default_user_limit=self.plugin_config.default_user_limit,
@@ -55,6 +63,29 @@ class VideoPlugin(Star):
             send_video_as_url=self.plugin_config.send_video_as_url,
         )
         self.worker_manager = WorkerManager(self.task_service)
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
+    async def record_context_message(self, event: AstrMessageEvent):
+        """记录最近消息上下文。"""
+        if not self.plugin_config.enable_context:
+            return
+
+        try:
+            content = (event.message_str or "").strip()
+            if not content:
+                return
+
+            sender_id = self._normalize_id(event.get_sender_id())
+            sender_name = getattr(event, "get_sender_name", lambda: sender_id)() or sender_id
+            self.context_repo.add_message(
+                event.unified_msg_origin,
+                sender_id=sender_id,
+                sender_name=str(sender_name),
+                content=content,
+                is_bot=False,
+            )
+        except Exception as exc:
+            logger.debug(f"记录视频上下文失败: {exc}")
 
     @filter.llm_tool(name="generate_text_video")
     async def text_to_video_tool(self, event: AstrMessageEvent, prompt: str) -> str:
@@ -72,6 +103,12 @@ class VideoPlugin(Star):
                     "[TOOL_FAILED] 缺少视频描述。请自然告诉用户需要提供更明确的视频描述。"
                 )
 
+            cooldown_ok, cooldown_msg = self._check_cooldown(event)
+            if not cooldown_ok:
+                return self._finalize_llm_tool_result(
+                    f"[TOOL_FAILED] {cooldown_msg}。请自然告诉用户稍后再来。"
+                )
+
             allowed, block_msg = self._check_quota(event)
             if not allowed:
                 return self._finalize_llm_tool_result(
@@ -79,6 +116,7 @@ class VideoPlugin(Star):
                 )
 
             final_prompt, preset_name, extra_prompt = self._process_prompt_and_preset(prompt)
+            final_prompt = self._merge_context_prompt(event, final_prompt)
 
             image_sources = await self.media_service.extract_image_sources(
                 event,
@@ -103,6 +141,7 @@ class VideoPlugin(Star):
                 )
 
             await event.send(event.plain_result(submit_text))
+            self._update_cooldown(event)
             self.worker_manager.submit(task.task_id)
             return self._finalize_llm_tool_result(
                 f"[TOOL_SUCCESS] 文生视频任务已提交，任务ID为 {task.task_id}。请自然告诉用户正在处理中，避免生硬复述工具文本。"
@@ -137,6 +176,12 @@ class VideoPlugin(Star):
                     "[TOOL_FAILED] 缺少过渡描述。请自然告诉用户需要补充过渡描述，并上传 2 张图片。"
                 )
 
+            cooldown_ok, cooldown_msg = self._check_cooldown(event)
+            if not cooldown_ok:
+                return self._finalize_llm_tool_result(
+                    f"[TOOL_FAILED] {cooldown_msg}。请自然告诉用户稍后再来。"
+                )
+
             allowed, block_msg = self._check_quota(event)
             if not allowed:
                 return self._finalize_llm_tool_result(
@@ -144,6 +189,7 @@ class VideoPlugin(Star):
                 )
 
             final_prompt, preset_name, extra_prompt = self._process_prompt_and_preset(prompt)
+            final_prompt = self._merge_context_prompt(event, final_prompt)
 
             image_sources = await self.media_service.extract_image_sources(
                 event,
@@ -170,6 +216,7 @@ class VideoPlugin(Star):
                 )
 
             await event.send(event.plain_result(submit_text))
+            self._update_cooldown(event)
             self.worker_manager.submit(task.task_id)
             return self._finalize_llm_tool_result(
                 f"[TOOL_SUCCESS] 首尾帧视频任务已提交，任务ID为 {task.task_id}。请自然告诉用户正在处理中。"
@@ -204,6 +251,12 @@ class VideoPlugin(Star):
                     "[TOOL_FAILED] 缺少视频描述。请自然告诉用户需要补充视频描述，并上传至少 2 张图片。"
                 )
 
+            cooldown_ok, cooldown_msg = self._check_cooldown(event)
+            if not cooldown_ok:
+                return self._finalize_llm_tool_result(
+                    f"[TOOL_FAILED] {cooldown_msg}。请自然告诉用户稍后再来。"
+                )
+
             allowed, block_msg = self._check_quota(event)
             if not allowed:
                 return self._finalize_llm_tool_result(
@@ -211,6 +264,7 @@ class VideoPlugin(Star):
                 )
 
             final_prompt, preset_name, extra_prompt = self._process_prompt_and_preset(prompt)
+            final_prompt = self._merge_context_prompt(event, final_prompt)
 
             image_sources = await self.media_service.extract_image_sources(
                 event,
@@ -240,6 +294,7 @@ class VideoPlugin(Star):
                 )
 
             await event.send(event.plain_result(submit_text))
+            self._update_cooldown(event)
             self.worker_manager.submit(task.task_id)
             return self._finalize_llm_tool_result(
                 f"[TOOL_SUCCESS] 多图视频任务已提交，任务ID为 {task.task_id}。请自然告诉用户正在处理中。"
@@ -514,6 +569,49 @@ class VideoPlugin(Star):
             )
         except Exception as exc:
             logger.error(f"保存视频预设本地备份失败: {exc}")
+
+    def _check_cooldown(self, event: AstrMessageEvent) -> tuple[bool, str]:
+        if not self.plugin_config.enable_cooldown:
+            return True, ""
+
+        if self._is_admin(event):
+            return True, ""
+
+        user_id = self._normalize_id(event.get_sender_id())
+        last_time = self.cooldown_records.get(user_id)
+        if not last_time:
+            return True, ""
+
+        elapsed = (datetime.now() - last_time).total_seconds()
+        remaining = self.plugin_config.cooldown_seconds - int(elapsed)
+        if remaining > 0:
+            return False, f"当前还在冷却中，请 {remaining} 秒后再试"
+
+        return True, ""
+
+    def _update_cooldown(self, event: AstrMessageEvent) -> None:
+        if not self.plugin_config.enable_cooldown:
+            return
+        user_id = self._normalize_id(event.get_sender_id())
+        if user_id:
+            self.cooldown_records[user_id] = datetime.now()
+
+    def _merge_context_prompt(self, event: AstrMessageEvent, prompt: str) -> str:
+        if not self.plugin_config.enable_context:
+            return prompt
+
+        context_text = self.context_repo.build_context_text(
+            event.unified_msg_origin,
+            count=self.plugin_config.context_rounds,
+        )
+        if not context_text:
+            return prompt
+
+        return (
+            f"{prompt}\n\n"
+            f"Recent conversation context:\n{context_text}\n"
+            f"Please keep the result consistent with the recent context when appropriate."
+        )
 
     def _check_quota(self, event: AstrMessageEvent) -> tuple[bool, str]:
         user_id = self._normalize_id(event.get_sender_id())
