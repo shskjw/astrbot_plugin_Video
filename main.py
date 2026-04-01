@@ -18,7 +18,7 @@ from context_repo import ContextRepo
 from exceptions import ConfigError, VideoPluginError
 from media_service import MediaService
 from message_service import MessageService
-from models import PluginConfigView, TaskType
+from models import PluginConfigView, TaskType, VideoTask
 from openai_video_client import OpenAIVideoClient
 from task_repo import TaskRepo
 from task_service import TaskService
@@ -35,7 +35,7 @@ DEFAULT_MAX_IMAGE_BYTES = 5 * 1024 * 1024
     PLUGIN_NAME,
     "shskjw",
     "openai格式视频生成插件，支持文生视频、首尾帧生成视频、多图生成视频",
-    "1.0.0",
+    "1.0.1",
 )
 class VideoPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -105,66 +105,12 @@ class VideoPlugin(Star):
 
     @filter.llm_tool(name="generate_text_video")
     async def text_to_video_tool(self, event: AstrMessageEvent, prompt: str) -> str:
-        '''文生视频工具。
-
-        仅当用户明确要求根据文字生成视频时调用。
-
-        Args:
-            prompt(string): 视频描述文本
-        '''
+        """文生视频工具。"""
         try:
-            prompt = (prompt or "").strip()
-            if not prompt:
-                return self._finalize_llm_tool_result(
-                    "[TOOL_FAILED] 缺少视频描述。请自然告诉用户需要提供更明确的视频描述。"
-                )
-            if len(prompt) > DEFAULT_MAX_PROMPT_LENGTH:
-                return self._finalize_llm_tool_result(
-                    f"[TOOL_FAILED] 视频描述过长，最多支持 {DEFAULT_MAX_PROMPT_LENGTH} 个字符。请自然告诉用户精简后重试。"
-                )
-
-            cooldown_ok, cooldown_msg = self._check_cooldown(event)
-            if not cooldown_ok:
-                return self._finalize_llm_tool_result(
-                    f"[TOOL_FAILED] {cooldown_msg}。请自然告诉用户稍后再来。"
-                )
-
-            allowed, block_msg = await self._check_quota(event)
-            if not allowed:
-                return self._finalize_llm_tool_result(
-                    f"[TOOL_FAILED] {block_msg}。请自然告诉用户当前无法使用。"
-                )
-
-            final_prompt, preset_name, extra_prompt = self._process_prompt_and_preset(prompt)
-            final_prompt = await self._merge_context_prompt(event, final_prompt)
-
-            image_sources = await self.media_service.extract_image_sources(
-                event,
-                context=self.context,
-            )
-            self.media_service.validate_text_mode_images(len(image_sources))
-
-            await self._consume_quota(event)
-
-            task = await self.task_service.create_task(
-                task_type=TaskType.TEXT,
-                prompt=final_prompt,
-                unified_msg_origin=event.unified_msg_origin,
-            )
-            submit_text = self.message_service.build_submit_text(task)
-            if preset_name != "自定义":
-                submit_text += f"\n预设: {preset_name}"
-            if extra_prompt:
-                submit_text += (
-                    f"\n补充描述: {extra_prompt[:50]}"
-                    f"{'...' if len(extra_prompt) > 50 else ''}"
-                )
-
+            submit_text = await self._submit_text_task(event, prompt)
             await event.send(event.plain_result(submit_text))
-            self._update_cooldown(event)
-            self.worker_manager.submit(task.task_id)
             return self._finalize_llm_tool_result(
-                f"[TOOL_SUCCESS] 文生视频任务已提交，任务ID为 {task.task_id}。请自然告诉用户正在处理中，避免生硬复述工具文本。"
+                f"[TOOL_SUCCESS] 文生视频任务已提交。请自然告诉用户正在处理中，避免生硬复述工具文本。"
             )
         except VideoPluginError as exc:
             return self._finalize_llm_tool_result(
@@ -182,68 +128,12 @@ class VideoPlugin(Star):
         event: AstrMessageEvent,
         prompt: str,
     ) -> str:
-        '''首尾帧生成视频工具。
-
-        仅当用户明确要求使用两张图片做首尾帧过渡视频时调用。
-
-        Args:
-            prompt(string): 过渡描述文本
-        '''
+        """首尾帧生成视频工具。"""
         try:
-            prompt = (prompt or "").strip()
-            if not prompt:
-                return self._finalize_llm_tool_result(
-                    "[TOOL_FAILED] 缺少过渡描述。请自然告诉用户需要补充过渡描述，并上传 2 张图片。"
-                )
-            if len(prompt) > DEFAULT_MAX_PROMPT_LENGTH:
-                return self._finalize_llm_tool_result(
-                    f"[TOOL_FAILED] 过渡描述过长，最多支持 {DEFAULT_MAX_PROMPT_LENGTH} 个字符。请自然告诉用户精简后重试。"
-                )
-
-            cooldown_ok, cooldown_msg = self._check_cooldown(event)
-            if not cooldown_ok:
-                return self._finalize_llm_tool_result(
-                    f"[TOOL_FAILED] {cooldown_msg}。请自然告诉用户稍后再来。"
-                )
-
-            allowed, block_msg = await self._check_quota(event)
-            if not allowed:
-                return self._finalize_llm_tool_result(
-                    f"[TOOL_FAILED] {block_msg}。请自然告诉用户当前无法使用。"
-                )
-
-            final_prompt, preset_name, extra_prompt = self._process_prompt_and_preset(prompt)
-            final_prompt = await self._merge_context_prompt(event, final_prompt)
-
-            image_sources = await self.media_service.extract_image_sources(
-                event,
-                context=self.context,
-            )
-            self.media_service.validate_first_last_images(len(image_sources))
-            data_urls = await self.media_service.convert_sources_to_data_urls(image_sources)
-
-            await self._consume_quota(event)
-
-            task = await self.task_service.create_task(
-                task_type=TaskType.FIRST_LAST,
-                prompt=final_prompt,
-                unified_msg_origin=event.unified_msg_origin,
-                images=data_urls,
-            )
-            submit_text = self.message_service.build_submit_text(task)
-            if preset_name != "自定义":
-                submit_text += f"\n预设: {preset_name}"
-            if extra_prompt:
-                submit_text += (
-                    f"\n补充描述: {extra_prompt[:50]}"
-                    f"{'...' if len(extra_prompt) > 50 else ''}"
-                )
-
+            submit_text = await self._submit_first_last_task(event, prompt)
             await event.send(event.plain_result(submit_text))
-            self._update_cooldown(event)
-            self.worker_manager.submit(task.task_id)
             return self._finalize_llm_tool_result(
-                f"[TOOL_SUCCESS] 首尾帧视频任务已提交，任务ID为 {task.task_id}。请自然告诉用户正在处理中。"
+                "[TOOL_SUCCESS] 首尾帧视频任务已提交。请自然告诉用户正在处理中。"
             )
         except VideoPluginError as exc:
             return self._finalize_llm_tool_result(
@@ -261,71 +151,12 @@ class VideoPlugin(Star):
         event: AstrMessageEvent,
         prompt: str,
     ) -> str:
-        '''多图生成视频工具。
-
-        仅当用户明确要求基于多张图片生成视频时调用。
-
-        Args:
-            prompt(string): 视频描述文本
-        '''
+        """多图生成视频工具。"""
         try:
-            prompt = (prompt or "").strip()
-            if not prompt:
-                return self._finalize_llm_tool_result(
-                    "[TOOL_FAILED] 缺少视频描述。请自然告诉用户需要补充视频描述，并上传至少 2 张图片。"
-                )
-            if len(prompt) > DEFAULT_MAX_PROMPT_LENGTH:
-                return self._finalize_llm_tool_result(
-                    f"[TOOL_FAILED] 视频描述过长，最多支持 {DEFAULT_MAX_PROMPT_LENGTH} 个字符。请自然告诉用户精简后重试。"
-                )
-
-            cooldown_ok, cooldown_msg = self._check_cooldown(event)
-            if not cooldown_ok:
-                return self._finalize_llm_tool_result(
-                    f"[TOOL_FAILED] {cooldown_msg}。请自然告诉用户稍后再来。"
-                )
-
-            allowed, block_msg = await self._check_quota(event)
-            if not allowed:
-                return self._finalize_llm_tool_result(
-                    f"[TOOL_FAILED] {block_msg}。请自然告诉用户当前无法使用。"
-                )
-
-            final_prompt, preset_name, extra_prompt = self._process_prompt_and_preset(prompt)
-            final_prompt = await self._merge_context_prompt(event, final_prompt)
-
-            image_sources = await self.media_service.extract_image_sources(
-                event,
-                context=self.context,
-            )
-            self.media_service.validate_multi_images(
-                len(image_sources),
-                self.plugin_config.max_images,
-            )
-            data_urls = await self.media_service.convert_sources_to_data_urls(image_sources)
-
-            await self._consume_quota(event)
-
-            task = await self.task_service.create_task(
-                task_type=TaskType.MULTI_IMAGE,
-                prompt=final_prompt,
-                unified_msg_origin=event.unified_msg_origin,
-                images=data_urls,
-            )
-            submit_text = self.message_service.build_submit_text(task)
-            if preset_name != "自定义":
-                submit_text += f"\n预设: {preset_name}"
-            if extra_prompt:
-                submit_text += (
-                    f"\n补充描述: {extra_prompt[:50]}"
-                    f"{'...' if len(extra_prompt) > 50 else ''}"
-                )
-
+            submit_text = await self._submit_multi_image_task(event, prompt)
             await event.send(event.plain_result(submit_text))
-            self._update_cooldown(event)
-            self.worker_manager.submit(task.task_id)
             return self._finalize_llm_tool_result(
-                f"[TOOL_SUCCESS] 多图视频任务已提交，任务ID为 {task.task_id}。请自然告诉用户正在处理中。"
+                "[TOOL_SUCCESS] 多图视频任务已提交。请自然告诉用户正在处理中。"
             )
         except VideoPluginError as exc:
             return self._finalize_llm_tool_result(
@@ -336,6 +167,51 @@ class VideoPlugin(Star):
             return self._finalize_llm_tool_result(
                 "[TOOL_FAILED] 多图生成视频任务提交失败。请自然告诉用户这次没弄好，稍后再试。"
             )
+
+    @filter.command("文生图视频", alias={"文生视频"})
+    async def command_text_video(self, event: AstrMessageEvent):
+        """文生视频命令入口。"""
+        prompt = self._extract_command_payload(event, "文生图视频", "文生视频")
+        try:
+            submit_text = await self._submit_text_task(event, prompt)
+            yield event.plain_result(submit_text)
+        except VideoPluginError as exc:
+            yield event.plain_result(str(exc))
+
+    @filter.command("图生视频", alias={"图片生成视频", "图片转视频"})
+    async def command_image_video(self, event: AstrMessageEvent):
+        """通用图生视频命令入口。1 图时自动使用首尾帧兼容模式，2 图时首尾帧，3 图及以上走多图模式。"""
+        prompt = self._extract_command_payload(event, "图生视频", "图片生成视频", "图片转视频")
+        try:
+            submit_text = await self._submit_image_video_task(event, prompt)
+            yield event.plain_result(submit_text)
+        except VideoPluginError as exc:
+            yield event.plain_result(str(exc))
+
+    @filter.command("首尾帧生成", alias={"首尾帧生成视频", "首尾帧视频"})
+    async def command_first_last_video(self, event: AstrMessageEvent):
+        """首尾帧生成视频命令入口。"""
+        prompt = self._extract_command_payload(
+            event,
+            "首尾帧生成",
+            "首尾帧生成视频",
+            "首尾帧视频",
+        )
+        try:
+            submit_text = await self._submit_first_last_task(event, prompt)
+            yield event.plain_result(submit_text)
+        except VideoPluginError as exc:
+            yield event.plain_result(str(exc))
+
+    @filter.command("多图视频", alias={"多图生成", "多图生成视频"})
+    async def command_multi_image_video(self, event: AstrMessageEvent):
+        """多图生成视频命令入口。"""
+        prompt = self._extract_command_payload(event, "多图视频", "多图生成", "多图生成视频")
+        try:
+            submit_text = await self._submit_multi_image_task(event, prompt)
+            yield event.plain_result(submit_text)
+        except VideoPluginError as exc:
+            yield event.plain_result(str(exc))
 
     @filter.command("视频预设列表", alias={"视频预设", "video预设"})
     async def list_video_presets(self, event: AstrMessageEvent):
@@ -527,12 +403,16 @@ class VideoPlugin(Star):
         help_text = (
             "视频插件当前支持：\n"
             "1. LLM Tool 调用：文生视频 / 首尾帧视频 / 多图视频\n"
-            "2. 视频预设列表、查看、添加、删除\n"
-            "3. 视频次数查询 / 视频签到\n"
-            "4. 管理员增加用户次数 / 群组次数\n"
-            "5. 管理员查看视频今日统计\n\n"
-            "预设格式：触发词:完整提示词\n"
-            "例如：电影感: cinematic camera movement, dramatic lighting"
+            "2. 命令调用：/文生图视频 / 图生视频 / 首尾帧生成 / 多图视频\n"
+            "3. 视频预设列表、查看、添加、删除\n"
+            "4. 视频次数查询 / 视频签到\n"
+            "5. 管理员增加用户次数 / 群组次数\n"
+            "6. 管理员查看视频今日统计\n\n"
+            "示例：\n"
+            "/文生图视频 一只小猫在雨夜街头奔跑\n"
+            "/图生视频 让图片里的角色自然动起来\n"
+            "/首尾帧生成 让第一张图平滑过渡到第二张图\n"
+            "/多图视频 把这几张图串成一段镜头运动视频"
         )
         yield event.plain_result(help_text)
 
@@ -559,6 +439,220 @@ class VideoPlugin(Star):
         user_id = self._normalize_id(event.get_sender_id())
         admins = self.context.get_config().get("admins_id", [])
         return user_id in [self._normalize_id(item) for item in admins]
+
+    def _extract_command_payload(self, event: AstrMessageEvent, *command_names: str) -> str:
+        text = (event.message_str or "").strip()
+        for command_name in command_names:
+            for prefix in (f"/{command_name}", command_name):
+                if text.startswith(prefix):
+                    return text[len(prefix) :].strip()
+        return text
+
+    def _ensure_prompt(
+        self,
+        prompt: str,
+        *,
+        missing_message: str,
+        default_prompt: str = "",
+    ) -> str:
+        prompt = (prompt or "").strip()
+        if not prompt:
+            prompt = default_prompt.strip()
+        if not prompt:
+            raise VideoPluginError(missing_message)
+        if len(prompt) > DEFAULT_MAX_PROMPT_LENGTH:
+            raise VideoPluginError(
+                f"描述过长，最多支持 {DEFAULT_MAX_PROMPT_LENGTH} 个字符，请精简后重试。"
+            )
+        return prompt
+
+    async def _prepare_prompt(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+    ) -> tuple[str, str, str]:
+        final_prompt, preset_name, extra_prompt = self._process_prompt_and_preset(prompt)
+        final_prompt = await self._merge_context_prompt(event, final_prompt)
+        return final_prompt, preset_name, extra_prompt
+
+    def _build_submit_text(
+        self,
+        task: VideoTask,
+        preset_name: str,
+        extra_prompt: str,
+    ) -> str:
+        submit_text = self.message_service.build_submit_text(task)
+        if preset_name != "自定义":
+            submit_text += f"\n预设: {preset_name}"
+        if extra_prompt:
+            submit_text += (
+                f"\n补充描述: {extra_prompt[:50]}"
+                f"{'...' if len(extra_prompt) > 50 else ''}"
+            )
+        return submit_text
+
+    async def _submit_text_task(self, event: AstrMessageEvent, prompt: str) -> str:
+        prompt = self._ensure_prompt(
+            prompt,
+            missing_message="缺少视频描述。请提供更明确的视频描述。",
+        )
+
+        cooldown_ok, cooldown_msg = self._check_cooldown(event)
+        if not cooldown_ok:
+            raise VideoPluginError(cooldown_msg)
+
+        allowed, block_msg = await self._check_quota(event)
+        if not allowed:
+            raise VideoPluginError(block_msg)
+
+        final_prompt, preset_name, extra_prompt = await self._prepare_prompt(event, prompt)
+
+        image_sources = await self.media_service.extract_image_sources(
+            event,
+            context=self.context,
+        )
+        self.media_service.validate_text_mode_images(len(image_sources))
+
+        await self._consume_quota(event)
+
+        task = await self.task_service.create_task(
+            task_type=TaskType.TEXT,
+            prompt=final_prompt,
+            unified_msg_origin=event.unified_msg_origin,
+        )
+        submit_text = self._build_submit_text(task, preset_name, extra_prompt)
+        self._update_cooldown(event)
+        self.worker_manager.submit(task.task_id)
+        return submit_text
+
+    async def _submit_first_last_task(self, event: AstrMessageEvent, prompt: str) -> str:
+        prompt = self._ensure_prompt(
+            prompt,
+            missing_message="缺少过渡描述。请补充过渡描述，并上传 2 张图片。",
+        )
+
+        cooldown_ok, cooldown_msg = self._check_cooldown(event)
+        if not cooldown_ok:
+            raise VideoPluginError(cooldown_msg)
+
+        allowed, block_msg = await self._check_quota(event)
+        if not allowed:
+            raise VideoPluginError(block_msg)
+
+        final_prompt, preset_name, extra_prompt = await self._prepare_prompt(event, prompt)
+
+        image_sources = await self.media_service.extract_image_sources(
+            event,
+            context=self.context,
+        )
+        self.media_service.validate_first_last_images(len(image_sources))
+        data_urls = await self.media_service.convert_sources_to_data_urls(image_sources)
+
+        await self._consume_quota(event)
+
+        task = await self.task_service.create_task(
+            task_type=TaskType.FIRST_LAST,
+            prompt=final_prompt,
+            unified_msg_origin=event.unified_msg_origin,
+            images=data_urls,
+        )
+        submit_text = self._build_submit_text(task, preset_name, extra_prompt)
+        self._update_cooldown(event)
+        self.worker_manager.submit(task.task_id)
+        return submit_text
+
+    async def _submit_multi_image_task(self, event: AstrMessageEvent, prompt: str) -> str:
+        prompt = self._ensure_prompt(
+            prompt,
+            missing_message="缺少视频描述。请补充视频描述，并上传至少 2 张图片。",
+        )
+
+        cooldown_ok, cooldown_msg = self._check_cooldown(event)
+        if not cooldown_ok:
+            raise VideoPluginError(cooldown_msg)
+
+        allowed, block_msg = await self._check_quota(event)
+        if not allowed:
+            raise VideoPluginError(block_msg)
+
+        final_prompt, preset_name, extra_prompt = await self._prepare_prompt(event, prompt)
+
+        image_sources = await self.media_service.extract_image_sources(
+            event,
+            context=self.context,
+        )
+        self.media_service.validate_multi_images(
+            len(image_sources),
+            self.plugin_config.max_images,
+        )
+        data_urls = await self.media_service.convert_sources_to_data_urls(image_sources)
+
+        await self._consume_quota(event)
+
+        task = await self.task_service.create_task(
+            task_type=TaskType.MULTI_IMAGE,
+            prompt=final_prompt,
+            unified_msg_origin=event.unified_msg_origin,
+            images=data_urls,
+        )
+        submit_text = self._build_submit_text(task, preset_name, extra_prompt)
+        self._update_cooldown(event)
+        self.worker_manager.submit(task.task_id)
+        return submit_text
+
+    async def _submit_image_video_task(self, event: AstrMessageEvent, prompt: str) -> str:
+        prompt = self._ensure_prompt(
+            prompt,
+            missing_message="请补充图生视频描述，并上传图片。",
+            default_prompt="让图片中的主体自然动起来，镜头平滑推进，保持画面稳定。",
+        )
+
+        cooldown_ok, cooldown_msg = self._check_cooldown(event)
+        if not cooldown_ok:
+            raise VideoPluginError(cooldown_msg)
+
+        allowed, block_msg = await self._check_quota(event)
+        if not allowed:
+            raise VideoPluginError(block_msg)
+
+        final_prompt, preset_name, extra_prompt = await self._prepare_prompt(event, prompt)
+
+        image_sources = await self.media_service.extract_image_sources(
+            event,
+            context=self.context,
+        )
+        image_count = len(image_sources)
+        if image_count <= 0:
+            raise VideoPluginError("没有检测到图片，请发送图片或引用带图片的消息后再试。")
+
+        data_urls = await self.media_service.convert_sources_to_data_urls(image_sources)
+
+        if image_count == 1:
+            task_type = TaskType.FIRST_LAST
+            task_images = [data_urls[0], data_urls[0]]
+        elif image_count == 2:
+            task_type = TaskType.FIRST_LAST
+            task_images = data_urls
+        else:
+            self.media_service.validate_multi_images(
+                image_count,
+                self.plugin_config.max_images,
+            )
+            task_type = TaskType.MULTI_IMAGE
+            task_images = data_urls
+
+        await self._consume_quota(event)
+
+        task = await self.task_service.create_task(
+            task_type=task_type,
+            prompt=final_prompt,
+            unified_msg_origin=event.unified_msg_origin,
+            images=task_images,
+        )
+        submit_text = self._build_submit_text(task, preset_name, extra_prompt)
+        self._update_cooldown(event)
+        self.worker_manager.submit(task.task_id)
+        return submit_text
 
     def _restore_dynamic_config(self) -> None:
         try:

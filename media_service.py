@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from astrbot.api import logger
 
 from exceptions import ImageCountError
 
@@ -39,8 +40,10 @@ class MediaService:
             seen_sources.add(source)
             results.append(source)
 
-        if message_chain:
-            for component in message_chain:
+        normalized_chain = self._flatten_components(message_chain)
+        if normalized_chain:
+            logger.debug(f"提取图片来源：当前消息链组件数 {len(normalized_chain)}")
+            for component in normalized_chain:
                 if self._is_reply_component(component):
                     reply_sources = await self._extract_reply_image_sources(
                         component,
@@ -89,6 +92,9 @@ class MediaService:
             )
 
     def _extract_image_source_from_component(self, component: Any) -> str:
+        if isinstance(component, (list, tuple)):
+            return ""
+
         component_type = self._safe_lower(getattr(component, "type", ""))
         class_name = component.__class__.__name__.lower()
 
@@ -240,10 +246,15 @@ class MediaService:
             seen_sources.add(source)
             results.append(source)
 
-        reply_chain = getattr(reply_component, "chain", None)
+        reply_chain = self._extract_reply_chain(reply_component)
+        logger.debug(
+            f"提取回复图片：reply_component_type={type(reply_component).__name__}, "
+            f"reply_chain_len={len(reply_chain)}"
+        )
+
         found_in_chain = False
         if reply_chain:
-            for item in list(reply_chain):
+            for item in reply_chain:
                 source = self._extract_image_source_from_component(item)
                 if source:
                     found_in_chain = True
@@ -252,9 +263,12 @@ class MediaService:
                     found_in_chain = True
                     add_source(text_source)
 
-        reply_id = getattr(reply_component, "id", None)
+        reply_id = self._extract_reply_id(reply_component)
         if (not found_in_chain) and context and reply_id:
             components = await self._fetch_reply_components(context, reply_id)
+            logger.debug(
+                f"提取回复图片：reply_id={reply_id}, fetched_components={len(components)}"
+            )
             for item in components:
                 source = self._extract_image_source_from_component(item)
                 if source:
@@ -263,6 +277,18 @@ class MediaService:
                     add_source(text_source)
 
         return results
+
+    def _extract_reply_chain(self, reply_component: Any) -> list[Any]:
+        if isinstance(reply_component, dict):
+            raw_chain = reply_component.get("chain")
+        else:
+            raw_chain = getattr(reply_component, "chain", None)
+        return self._flatten_components(raw_chain)
+
+    def _extract_reply_id(self, reply_component: Any) -> Any:
+        if isinstance(reply_component, dict):
+            return reply_component.get("id")
+        return getattr(reply_component, "id", None)
 
     async def _fetch_reply_components(self, context: Any, reply_id: Any) -> list[Any]:
         bot = await self._resolve_bot_for_context(context)
@@ -281,12 +307,13 @@ class MediaService:
                 if not result:
                     continue
                 if hasattr(result, "message_obj") and hasattr(result.message_obj, "message"):
-                    return list(result.message_obj.message)
+                    return self._flatten_components(result.message_obj.message)
                 if hasattr(result, "message"):
-                    return list(result.message)
+                    return self._flatten_components(result.message)
                 if isinstance(result, list):
-                    return result
-            except Exception:
+                    return self._flatten_components(result)
+            except Exception as exc:
+                logger.debug(f"获取回复消息失败 {method_name}: {exc}")
                 continue
 
         return []
@@ -321,6 +348,16 @@ class MediaService:
         return self._extract_image_sources_from_text(text)
 
     def _extract_image_sources_from_text_component(self, component: Any) -> list[str]:
+        if isinstance(component, (list, tuple)):
+            results: list[str] = []
+            seen: set[str] = set()
+            for item in self._flatten_components(component):
+                for source in self._extract_image_sources_from_text_component(item):
+                    if source not in seen:
+                        seen.add(source)
+                        results.append(source)
+            return results
+
         texts: list[str] = []
 
         if isinstance(component, dict):
@@ -405,12 +442,29 @@ class MediaService:
         return ""
 
     def _is_reply_component(self, component: Any) -> bool:
+        if isinstance(component, (list, tuple)):
+            return False
+
         class_name = component.__class__.__name__.lower()
         if class_name == "reply" or self._safe_lower(getattr(component, "type", "")) == "reply":
             return True
         if isinstance(component, dict):
             return self._safe_lower(component.get("type", "")) == "reply"
         return False
+
+    def _flatten_components(self, components: Any) -> list[Any]:
+        if components is None:
+            return []
+        if not isinstance(components, (list, tuple)):
+            return [components]
+
+        flattened: list[Any] = []
+        for item in components:
+            if isinstance(item, (list, tuple)):
+                flattened.extend(self._flatten_components(item))
+            elif item is not None:
+                flattened.append(item)
+        return flattened
 
     def _is_probably_valid_source(self, source: Any) -> bool:
         if source is None:
