@@ -63,7 +63,7 @@ class ContextRepo:
 
         lines: list[str] = []
         for item in messages:
-            role = "机器人" if item.get("is_bot") else (item.get("sender_name") or "用户")
+            role = "assistant" if item.get("is_bot") else "user"
             content = str(item.get("content", "")).strip()
             if content:
                 lines.append(f"{role}: {content}")
