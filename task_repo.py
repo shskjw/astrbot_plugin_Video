@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
+
+import aiofiles
 
 from models import TaskStatus, VideoTask
 
@@ -10,26 +13,30 @@ class TaskRepo:
     def __init__(self, base_dir: Path):
         self.base_dir = base_dir
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = asyncio.Lock()
 
     def get_task_path(self, task_id: str) -> Path:
         return self.base_dir / f"{task_id}.json"
 
-    def save(self, task: VideoTask) -> None:
+    async def save(self, task: VideoTask) -> None:
         task.touch()
         path = self.get_task_path(task.task_id)
-        path.write_text(
-            json.dumps(task.to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        payload = json.dumps(task.to_dict(), ensure_ascii=False, indent=2)
+        async with self._lock:
+            async with aiofiles.open(path, "w", encoding="utf-8") as file:
+                await file.write(payload)
 
-    def load(self, task_id: str) -> VideoTask | None:
+    async def load(self, task_id: str) -> VideoTask | None:
         path = self.get_task_path(task_id)
         if not path.exists():
             return None
-        data = json.loads(path.read_text(encoding="utf-8"))
+        async with self._lock:
+            async with aiofiles.open(path, "r", encoding="utf-8") as file:
+                raw = await file.read()
+        data = json.loads(raw)
         return VideoTask.from_dict(data)
 
-    def update_status(
+    async def update_status(
         self,
         task_id: str,
         status: TaskStatus,
@@ -39,7 +46,7 @@ class TaskRepo:
         error_message: str = "",
         raw_response: dict | None = None,
     ) -> VideoTask | None:
-        task = self.load(task_id)
+        task = await self.load(task_id)
         if task is None:
             return None
 
@@ -52,5 +59,5 @@ class TaskRepo:
             task.error_message = error_message
         if raw_response is not None:
             task.raw_response = raw_response
-        self.save(task)
+        await self.save(task)
         return task

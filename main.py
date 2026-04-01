@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -8,6 +9,10 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+CURRENT_DIR = Path(__file__).resolve().parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
 
 from context_repo import ContextRepo
 from exceptions import ConfigError, VideoPluginError
@@ -20,9 +25,14 @@ from task_service import TaskService
 from usage_repo import UsageRepo
 from worker import WorkerManager
 
+PLUGIN_NAME = "astrbot_plugin_Video"
+DEFAULT_MAX_CONCURRENT_TASKS = 3
+DEFAULT_MAX_PROMPT_LENGTH = 4000
+DEFAULT_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
 
 @register(
-    "astrbot_plugin_Video",
+    PLUGIN_NAME,
     "shskjw",
     "openai格式视频生成插件，支持文生视频、首尾帧生成视频、多图生成视频",
     "1.0.0",
@@ -40,7 +50,11 @@ class VideoPlugin(Star):
         usage_dir = plugin_data_dir / "usage"
         context_dir = plugin_data_dir / "contexts"
 
-        self.media_service = MediaService(timeout=min(self.plugin_config.timeout, 60))
+        self.media_service = MediaService(
+            timeout=min(self.plugin_config.timeout, 60),
+            max_image_bytes=DEFAULT_MAX_IMAGE_BYTES,
+            allow_local_file_image=self.plugin_config.allow_local_file_image,
+        )
         self.message_service = MessageService()
         self.task_repo = TaskRepo(task_dir)
         self.context_repo = ContextRepo(
@@ -60,9 +74,11 @@ class VideoPlugin(Star):
             message_service=self.message_service,
             client=self.client,
             context=self.context,
-            send_video_as_url=self.plugin_config.send_video_as_url,
         )
-        self.worker_manager = WorkerManager(self.task_service)
+        self.worker_manager = WorkerManager(
+            self.task_service,
+            max_concurrent_tasks=DEFAULT_MAX_CONCURRENT_TASKS,
+        )
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
     async def record_context_message(self, event: AstrMessageEvent):
@@ -77,7 +93,7 @@ class VideoPlugin(Star):
 
             sender_id = self._normalize_id(event.get_sender_id())
             sender_name = getattr(event, "get_sender_name", lambda: sender_id)() or sender_id
-            self.context_repo.add_message(
+            await self.context_repo.add_message(
                 event.unified_msg_origin,
                 sender_id=sender_id,
                 sender_name=str(sender_name),
@@ -102,6 +118,10 @@ class VideoPlugin(Star):
                 return self._finalize_llm_tool_result(
                     "[TOOL_FAILED] 缺少视频描述。请自然告诉用户需要提供更明确的视频描述。"
                 )
+            if len(prompt) > DEFAULT_MAX_PROMPT_LENGTH:
+                return self._finalize_llm_tool_result(
+                    f"[TOOL_FAILED] 视频描述过长，最多支持 {DEFAULT_MAX_PROMPT_LENGTH} 个字符。请自然告诉用户精简后重试。"
+                )
 
             cooldown_ok, cooldown_msg = self._check_cooldown(event)
             if not cooldown_ok:
@@ -109,14 +129,14 @@ class VideoPlugin(Star):
                     f"[TOOL_FAILED] {cooldown_msg}。请自然告诉用户稍后再来。"
                 )
 
-            allowed, block_msg = self._check_quota(event)
+            allowed, block_msg = await self._check_quota(event)
             if not allowed:
                 return self._finalize_llm_tool_result(
                     f"[TOOL_FAILED] {block_msg}。请自然告诉用户当前无法使用。"
                 )
 
             final_prompt, preset_name, extra_prompt = self._process_prompt_and_preset(prompt)
-            final_prompt = self._merge_context_prompt(event, final_prompt)
+            final_prompt = await self._merge_context_prompt(event, final_prompt)
 
             image_sources = await self.media_service.extract_image_sources(
                 event,
@@ -124,9 +144,9 @@ class VideoPlugin(Star):
             )
             self.media_service.validate_text_mode_images(len(image_sources))
 
-            self._consume_quota(event)
+            await self._consume_quota(event)
 
-            task = self.task_service.create_task(
+            task = await self.task_service.create_task(
                 task_type=TaskType.TEXT,
                 prompt=final_prompt,
                 unified_msg_origin=event.unified_msg_origin,
@@ -175,6 +195,10 @@ class VideoPlugin(Star):
                 return self._finalize_llm_tool_result(
                     "[TOOL_FAILED] 缺少过渡描述。请自然告诉用户需要补充过渡描述，并上传 2 张图片。"
                 )
+            if len(prompt) > DEFAULT_MAX_PROMPT_LENGTH:
+                return self._finalize_llm_tool_result(
+                    f"[TOOL_FAILED] 过渡描述过长，最多支持 {DEFAULT_MAX_PROMPT_LENGTH} 个字符。请自然告诉用户精简后重试。"
+                )
 
             cooldown_ok, cooldown_msg = self._check_cooldown(event)
             if not cooldown_ok:
@@ -182,14 +206,14 @@ class VideoPlugin(Star):
                     f"[TOOL_FAILED] {cooldown_msg}。请自然告诉用户稍后再来。"
                 )
 
-            allowed, block_msg = self._check_quota(event)
+            allowed, block_msg = await self._check_quota(event)
             if not allowed:
                 return self._finalize_llm_tool_result(
                     f"[TOOL_FAILED] {block_msg}。请自然告诉用户当前无法使用。"
                 )
 
             final_prompt, preset_name, extra_prompt = self._process_prompt_and_preset(prompt)
-            final_prompt = self._merge_context_prompt(event, final_prompt)
+            final_prompt = await self._merge_context_prompt(event, final_prompt)
 
             image_sources = await self.media_service.extract_image_sources(
                 event,
@@ -198,9 +222,9 @@ class VideoPlugin(Star):
             self.media_service.validate_first_last_images(len(image_sources))
             data_urls = await self.media_service.convert_sources_to_data_urls(image_sources)
 
-            self._consume_quota(event)
+            await self._consume_quota(event)
 
-            task = self.task_service.create_task(
+            task = await self.task_service.create_task(
                 task_type=TaskType.FIRST_LAST,
                 prompt=final_prompt,
                 unified_msg_origin=event.unified_msg_origin,
@@ -250,6 +274,10 @@ class VideoPlugin(Star):
                 return self._finalize_llm_tool_result(
                     "[TOOL_FAILED] 缺少视频描述。请自然告诉用户需要补充视频描述，并上传至少 2 张图片。"
                 )
+            if len(prompt) > DEFAULT_MAX_PROMPT_LENGTH:
+                return self._finalize_llm_tool_result(
+                    f"[TOOL_FAILED] 视频描述过长，最多支持 {DEFAULT_MAX_PROMPT_LENGTH} 个字符。请自然告诉用户精简后重试。"
+                )
 
             cooldown_ok, cooldown_msg = self._check_cooldown(event)
             if not cooldown_ok:
@@ -257,14 +285,14 @@ class VideoPlugin(Star):
                     f"[TOOL_FAILED] {cooldown_msg}。请自然告诉用户稍后再来。"
                 )
 
-            allowed, block_msg = self._check_quota(event)
+            allowed, block_msg = await self._check_quota(event)
             if not allowed:
                 return self._finalize_llm_tool_result(
                     f"[TOOL_FAILED] {block_msg}。请自然告诉用户当前无法使用。"
                 )
 
             final_prompt, preset_name, extra_prompt = self._process_prompt_and_preset(prompt)
-            final_prompt = self._merge_context_prompt(event, final_prompt)
+            final_prompt = await self._merge_context_prompt(event, final_prompt)
 
             image_sources = await self.media_service.extract_image_sources(
                 event,
@@ -276,9 +304,9 @@ class VideoPlugin(Star):
             )
             data_urls = await self.media_service.convert_sources_to_data_urls(image_sources)
 
-            self._consume_quota(event)
+            await self._consume_quota(event)
 
-            task = self.task_service.create_task(
+            task = await self.task_service.create_task(
                 task_type=TaskType.MULTI_IMAGE,
                 prompt=final_prompt,
                 unified_msg_origin=event.unified_msg_origin,
@@ -394,14 +422,14 @@ class VideoPlugin(Star):
 
         lines = []
         if self.plugin_config.enable_user_limit:
-            lines.append(f"你的剩余视频次数：{self.usage_repo.get_user_count(user_id)}")
+            lines.append(f"你的剩余视频次数：{await self.usage_repo.get_user_count(user_id)}")
         else:
             lines.append("用户次数限制：未启用")
 
         if group_id:
             if self.plugin_config.enable_group_limit:
                 lines.append(
-                    f"当前群剩余视频次数：{self.usage_repo.get_group_count(group_id)}"
+                    f"当前群剩余视频次数：{await self.usage_repo.get_group_count(group_id)}"
                 )
             else:
                 lines.append("群组次数限制：未启用")
@@ -419,7 +447,7 @@ class VideoPlugin(Star):
             yield event.plain_result("增加次数必须大于 0。")
             return
 
-        new_count = self.usage_repo.add_user_count(self._normalize_id(user_id), count)
+        new_count = await self.usage_repo.add_user_count(self._normalize_id(user_id), count)
         yield event.plain_result(
             f"已为用户 {user_id} 增加 {count} 次，当前剩余：{new_count}"
         )
@@ -435,7 +463,7 @@ class VideoPlugin(Star):
             yield event.plain_result("增加次数必须大于 0。")
             return
 
-        new_count = self.usage_repo.add_group_count(self._normalize_id(group_id), count)
+        new_count = await self.usage_repo.add_group_count(self._normalize_id(group_id), count)
         yield event.plain_result(
             f"已为群组 {group_id} 增加 {count} 次，当前剩余：{new_count}"
         )
@@ -448,7 +476,7 @@ class VideoPlugin(Star):
             return
 
         user_id = self._normalize_id(event.get_sender_id())
-        success, new_count = self.usage_repo.process_checkin(
+        success, new_count = await self.usage_repo.process_checkin(
             user_id,
             self.plugin_config.checkin_add_count,
         )
@@ -467,7 +495,7 @@ class VideoPlugin(Star):
             yield event.plain_result("只有管理员可以查看视频今日统计。")
             return
 
-        stats = self.usage_repo.get_daily_stats()
+        stats = await self.usage_repo.get_daily_stats()
         date = stats.get("date", "")
         total = int(stats.get("total", 0))
         users = dict(stats.get("users", {}))
@@ -522,7 +550,7 @@ class VideoPlugin(Star):
             ) from exc
 
     def _get_plugin_data_dir(self) -> Path:
-        return get_astrbot_data_path() / "plugin_data" / self.name
+        return Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
 
     def _normalize_id(self, value: str | None) -> str:
         return str(value or "").strip()
@@ -596,16 +624,20 @@ class VideoPlugin(Star):
         if user_id:
             self.cooldown_records[user_id] = datetime.now()
 
-    def _merge_context_prompt(self, event: AstrMessageEvent, prompt: str) -> str:
+    async def _merge_context_prompt(self, event: AstrMessageEvent, prompt: str) -> str:
         if not self.plugin_config.enable_context:
             return prompt
 
-        context_text = self.context_repo.build_context_text(
+        context_text = await self.context_repo.build_context_text(
             event.unified_msg_origin,
             count=self.plugin_config.context_rounds,
         )
         if not context_text:
             return prompt
+
+        max_context_chars = max(0, int(self.plugin_config.max_context_chars))
+        if max_context_chars > 0 and len(context_text) > max_context_chars:
+            context_text = context_text[-max_context_chars:]
 
         return (
             f"{prompt}\n\n"
@@ -613,7 +645,7 @@ class VideoPlugin(Star):
             f"Please keep the result consistent with the recent context when appropriate."
         )
 
-    def _check_quota(self, event: AstrMessageEvent) -> tuple[bool, str]:
+    async def _check_quota(self, event: AstrMessageEvent) -> tuple[bool, str]:
         user_id = self._normalize_id(event.get_sender_id())
         group_id = self._normalize_id(event.get_group_id())
 
@@ -633,29 +665,29 @@ class VideoPlugin(Star):
             return False, "当前群组不在视频功能白名单中"
 
         if self.plugin_config.enable_user_limit:
-            user_count = self.usage_repo.get_user_count(user_id)
+            user_count = await self.usage_repo.get_user_count(user_id)
             if user_count <= 0:
                 return False, "你的视频生成次数已经用完了"
 
         if group_id and self.plugin_config.enable_group_limit:
-            group_count = self.usage_repo.get_group_count(group_id)
+            group_count = await self.usage_repo.get_group_count(group_id)
             if group_count <= 0:
                 return False, "当前群的视频生成次数已经用完了"
 
         return True, ""
 
-    def _consume_quota(self, event: AstrMessageEvent) -> None:
+    async def _consume_quota(self, event: AstrMessageEvent) -> None:
         user_id = self._normalize_id(event.get_sender_id())
         group_id = self._normalize_id(event.get_group_id())
 
         if not self._is_admin(event):
             if self.plugin_config.enable_user_limit and user_id:
-                self.usage_repo.decrease_user_count(user_id, 1)
+                await self.usage_repo.decrease_user_count(user_id, 1)
 
             if self.plugin_config.enable_group_limit and group_id:
-                self.usage_repo.decrease_group_count(group_id, 1)
+                await self.usage_repo.decrease_group_count(group_id, 1)
 
-        self.usage_repo.record_usage(user_id, group_id)
+        await self.usage_repo.record_usage(user_id, group_id)
 
     def _process_prompt_and_preset(self, prompt: str) -> tuple[str, str, str]:
         prompt = (prompt or "").strip()

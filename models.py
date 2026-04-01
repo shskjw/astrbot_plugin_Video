@@ -32,8 +32,6 @@ class PluginConfigView:
     model: str
     timeout: int = 600
     max_images: int = 6
-    download_video: bool = False
-    send_video_as_url: bool = True
     prompt_list: list[str] = field(default_factory=list)
     user_blacklist: list[str] = field(default_factory=list)
     group_blacklist: list[str] = field(default_factory=list)
@@ -48,8 +46,10 @@ class PluginConfigView:
     enable_context: bool = True
     context_max_messages: int = 20
     context_rounds: int = 6
+    max_context_chars: int = 2000
     enable_cooldown: bool = True
     cooldown_seconds: int = 60
+    allow_local_file_image: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PluginConfigView":
@@ -59,8 +59,6 @@ class PluginConfigView:
             model=str(data.get("model", "")),
             timeout=int(data.get("timeout", 600)),
             max_images=int(data.get("max_images", 6)),
-            download_video=bool(data.get("download_video", False)),
-            send_video_as_url=bool(data.get("send_video_as_url", True)),
             prompt_list=[str(item) for item in data.get("prompt_list", [])],
             user_blacklist=[str(item) for item in data.get("user_blacklist", [])],
             group_blacklist=[str(item) for item in data.get("group_blacklist", [])],
@@ -75,17 +73,15 @@ class PluginConfigView:
             enable_context=bool(data.get("enable_context", True)),
             context_max_messages=int(data.get("context_max_messages", 20)),
             context_rounds=int(data.get("context_rounds", 6)),
+            max_context_chars=int(data.get("max_context_chars", 2000)),
             enable_cooldown=bool(data.get("enable_cooldown", True)),
             cooldown_seconds=int(data.get("cooldown_seconds", 60)),
+            allow_local_file_image=bool(data.get("allow_local_file_image", False)),
         )
 
     def validate(self) -> None:
-        if not self.base_url:
-            raise ValueError("插件配置缺少 base_url")
-        if not self.api_key:
-            raise ValueError("插件配置缺少 api_key")
-        if not self.model:
-            raise ValueError("插件配置缺少 model")
+        # 允许插件在未完整配置 API 参数时先加载成功，
+        # 真正调用视频功能时再进行运行时校验，避免用户刚安装就报错。
         if self.timeout <= 0:
             raise ValueError("timeout 必须大于 0")
         if self.max_images < 2:
@@ -100,6 +96,8 @@ class PluginConfigView:
             raise ValueError("context_max_messages 不能小于 1")
         if self.context_rounds < 0:
             raise ValueError("context_rounds 不能小于 0")
+        if self.max_context_chars < 0:
+            raise ValueError("max_context_chars 不能小于 0")
         if self.cooldown_seconds < 0:
             raise ValueError("cooldown_seconds 不能小于 0")
 

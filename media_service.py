@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import mimetypes
+import re
 from pathlib import Path
 from typing import Any
-import inspect
-import re
 
 import httpx
 
@@ -13,8 +13,15 @@ from exceptions import ImageCountError
 
 
 class MediaService:
-    def __init__(self, timeout: int = 60):
+    def __init__(
+        self,
+        timeout: int = 60,
+        max_image_bytes: int = 5 * 1024 * 1024,
+        allow_local_file_image: bool = False,
+    ):
         self.timeout = timeout
+        self.max_image_bytes = max(1024, int(max_image_bytes))
+        self.allow_local_file_image = bool(allow_local_file_image)
 
     async def extract_image_sources(self, event: Any, context: Any = None) -> list[str]:
         message_obj = getattr(event, "message_obj", None)
@@ -118,37 +125,103 @@ class MediaService:
     async def _source_to_data_url(self, source: str) -> str:
         source = source.strip()
         if source.startswith("data:image/"):
-            return source
+            return self._validate_data_url(source)
 
         if source.startswith(("http://", "https://")):
             return await self._url_to_data_url(source)
 
-        path = Path(source)
-        if path.exists() and path.is_file():
-            return self._file_to_data_url(path)
+        if source.startswith("base64://"):
+            return self._base64_to_data_url(source[len("base64://") :].strip())
 
         if self._looks_like_base64(source):
-            return f"data:image/jpeg;base64,{source}"
+            return self._base64_to_data_url(source)
+
+        path = Path(source)
+        if path.exists() and path.is_file():
+            if not self.allow_local_file_image:
+                raise ImageCountError("当前环境禁止读取本地文件图片，请改用消息图片或公网图片链接。")
+            return self._file_to_data_url(path)
 
         raise ImageCountError(f"无法识别图片来源：{source}")
 
     async def _url_to_data_url(self, url: str) -> str:
         timeout = httpx.Timeout(timeout=self.timeout, connect=min(self.timeout, 20))
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.get(url)
-                response.raise_for_status()
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                async with client.stream("GET", url) as response:
+                    response.raise_for_status()
+                    content_length = response.headers.get("Content-Length", "").strip()
+                    if content_length.isdigit() and int(content_length) > self.max_image_bytes:
+                        raise ImageCountError(
+                            f"图片过大，已超过安全限制 {self.max_image_bytes} 字节"
+                        )
+
+                    content = await self._read_limited_bytes(response, self.max_image_bytes)
+                    content_type = response.headers.get("Content-Type", "image/jpeg").split(";")[0]
+        except ImageCountError:
+            raise
         except httpx.HTTPError as exc:
             raise ImageCountError(f"下载图片失败：{exc}") from exc
 
-        content_type = response.headers.get("Content-Type", "image/jpeg").split(";")[0]
-        encoded = base64.b64encode(response.content).decode("utf-8")
+        encoded = base64.b64encode(content).decode("utf-8")
         return f"data:{content_type};base64,{encoded}"
 
     def _file_to_data_url(self, path: Path) -> str:
+        try:
+            file_size = path.stat().st_size
+        except OSError as exc:
+            raise ImageCountError(f"读取本地图片失败：{exc}") from exc
+
+        if file_size > self.max_image_bytes:
+            raise ImageCountError(f"本地图片过大，已超过安全限制 {self.max_image_bytes} 字节")
+
         mime_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
         encoded = base64.b64encode(path.read_bytes()).decode("utf-8")
         return f"data:{mime_type};base64,{encoded}"
+
+    def _validate_data_url(self, source: str) -> str:
+        prefix, sep, encoded = source.partition(",")
+        if not sep or not encoded:
+            raise ImageCountError("图片 data URL 格式无效")
+
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except Exception as exc:
+            raise ImageCountError(f"图片 data URL 解析失败：{exc}") from exc
+
+        if len(raw) > self.max_image_bytes:
+            raise ImageCountError(f"图片过大，已超过安全限制 {self.max_image_bytes} 字节")
+
+        return source
+
+    def _base64_to_data_url(self, encoded: str) -> str:
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except Exception as exc:
+            raise ImageCountError(f"图片 base64 数据无效：{exc}") from exc
+
+        if len(raw) > self.max_image_bytes:
+            raise ImageCountError(f"图片过大，已超过安全限制 {self.max_image_bytes} 字节")
+
+        return f"data:image/jpeg;base64,{encoded}"
+
+    async def _read_limited_bytes(
+        self,
+        response: httpx.Response,
+        limit: int,
+    ) -> bytes:
+        chunks: list[bytes] = []
+        total = 0
+
+        async for chunk in response.aiter_bytes():
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > limit:
+                raise ImageCountError(f"图片过大，已超过安全限制 {limit} 字节")
+            chunks.append(chunk)
+
+        return b"".join(chunks)
 
     async def _extract_reply_image_sources(
         self,

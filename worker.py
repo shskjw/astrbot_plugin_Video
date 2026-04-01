@@ -9,17 +9,24 @@ from task_service import TaskService
 
 
 class WorkerManager:
-    def __init__(self, task_service: TaskService):
+    def __init__(self, task_service: TaskService, max_concurrent_tasks: int = 3):
         self.task_service = task_service
+        self.max_concurrent_tasks = max(1, int(max_concurrent_tasks))
         self._tasks: set[asyncio.Task[Any]] = set()
+        self._semaphore = asyncio.Semaphore(self.max_concurrent_tasks)
+        self._closed = False
 
     def submit(self, task_id: str) -> asyncio.Task[Any]:
+        if self._closed:
+            raise RuntimeError("视频任务 worker 已关闭，无法继续提交任务")
+
         task = asyncio.create_task(self._run(task_id))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return task
 
     async def shutdown(self) -> None:
+        self._closed = True
         if not self._tasks:
             return
 
@@ -36,7 +43,8 @@ class WorkerManager:
 
     async def _run(self, task_id: str) -> None:
         try:
-            await self.task_service.process_task(task_id)
+            async with self._semaphore:
+                await self.task_service.process_task(task_id)
         except asyncio.CancelledError:
             logger.info(f"视频任务已取消: {task_id}")
             raise

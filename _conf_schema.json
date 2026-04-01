@@ -29,18 +29,6 @@
     "hint": "多图生成视频允许上传的最大图片数",
     "default": 6
   },
-  "download_video": {
-    "description": "是否下载视频到本地后发送",
-    "type": "bool",
-    "hint": "关闭时优先直接发送链接，开启时会先尝试下载到本地",
-    "default": false
-  },
-  "send_video_as_url": {
-    "description": "是否优先发送视频链接",
-    "type": "bool",
-    "hint": "开启后优先发送视频链接，失败时再尝试其他方式",
-    "default": true
-  },
   "prompt_list": {
     "description": "视频预设列表",
     "type": "list",
@@ -125,6 +113,12 @@
     "hint": "生成视频时最多附加多少条最近上下文摘要",
     "default": 6
   },
+  "max_context_chars": {
+    "description": "上下文最大字符数",
+    "type": "int",
+    "hint": "拼接到提示词中的上下文最大字符数，防止请求体过大",
+    "default": 2000
+  },
   "enable_cooldown": {
     "description": "是否启用冷却时间",
     "type": "bool",
@@ -136,5 +130,11 @@
     "type": "int",
     "hint": "同一用户两次视频任务提交之间的最小间隔秒数",
     "default": 60
+  },
+  "allow_local_file_image": {
+    "description": "是否允许读取本地文件图片",
+    "type": "bool",
+    "hint": "默认关闭，避免用户通过路径读取宿主机本地文件；仅在可信环境中开启",
+    "default": false
   }
 }

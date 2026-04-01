@@ -19,16 +19,14 @@ class TaskService:
         message_service: MessageService,
         client: OpenAIVideoClient,
         context: Any,
-        send_video_as_url: bool = True,
     ):
         self.task_repo = task_repo
         self.media_service = media_service
         self.message_service = message_service
         self.client = client
         self.context = context
-        self.send_video_as_url = send_video_as_url
 
-    def create_task(
+    async def create_task(
         self,
         *,
         task_type: TaskType,
@@ -44,16 +42,16 @@ class TaskService:
             images=images or [],
             status=TaskStatus.PENDING,
         )
-        self.task_repo.save(task)
+        await self.task_repo.save(task)
         return task
 
     async def process_task(self, task_id: str) -> VideoTask:
-        task = self.task_repo.load(task_id)
+        task = await self.task_repo.load(task_id)
         if task is None:
             raise TaskProcessError(f"任务不存在: {task_id}")
 
-        self.task_repo.update_status(task_id, TaskStatus.PROCESSING)
-        task = self.task_repo.load(task_id)
+        await self.task_repo.update_status(task_id, TaskStatus.PROCESSING)
+        task = await self.task_repo.load(task_id)
         if task is None:
             raise TaskProcessError(f"任务状态更新后丢失: {task_id}")
 
@@ -61,7 +59,7 @@ class TaskService:
             result = await self._submit_task(task)
             video_url = str(result.get("video_url", "")).strip()
             result_file = str(result.get("result_file", "")).strip()
-            saved = self.task_repo.update_status(
+            saved = await self.task_repo.update_status(
                 task_id,
                 TaskStatus.SUCCESS,
                 result_url=video_url,
@@ -74,12 +72,11 @@ class TaskService:
             await self.message_service.send_result_notification(
                 self.context,
                 saved,
-                prefer_url=self.send_video_as_url,
             )
             return saved
         except Exception as exc:
             message = str(exc)
-            saved = self.task_repo.update_status(
+            saved = await self.task_repo.update_status(
                 task_id,
                 TaskStatus.FAILED,
                 error_message=message,
@@ -89,7 +86,6 @@ class TaskService:
                 await self.message_service.send_result_notification(
                     self.context,
                     saved,
-                    prefer_url=self.send_video_as_url,
                 )
                 return saved
             raise

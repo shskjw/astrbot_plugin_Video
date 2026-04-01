@@ -9,6 +9,8 @@ import httpx
 from exceptions import ProviderAPIError
 from models import PluginConfigView
 
+DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024
+
 
 class OpenAIVideoClient:
     def __init__(self, config: PluginConfigView):
@@ -80,18 +82,42 @@ class OpenAIVideoClient:
                     headers=headers,
                     json=payload,
                 ) as response:
-                    text = await response.aread()
-                    raw_text = text.decode("utf-8", errors="ignore")
-                    if response.status_code >= 400:
-                        raise ProviderAPIError(
-                            f"视频接口请求失败，HTTP {response.status_code}: {raw_text}"
-                        )
+                    response.raise_for_status()
+                    raw_bytes = await self._read_limited_response(response)
+                    raw_text = raw_bytes.decode("utf-8", errors="ignore")
+        except httpx.HTTPStatusError as exc:
+            body = ""
+            if exc.response is not None:
+                try:
+                    body = exc.response.text
+                except Exception:
+                    body = ""
+            raise ProviderAPIError(
+                f"视频接口请求失败，HTTP {exc.response.status_code if exc.response else 'unknown'}: {body}"
+            ) from exc
         except httpx.HTTPError as exc:
             raise ProviderAPIError(f"视频接口请求异常: {exc}") from exc
 
         parsed = self._parse_response_text(raw_text)
         parsed["raw_text"] = raw_text
         return parsed
+
+    async def _read_limited_response(self, response: httpx.Response) -> bytes:
+        chunks: list[bytes] = []
+        total = 0
+        max_bytes = DEFAULT_MAX_RESPONSE_BYTES
+
+        async for chunk in response.aiter_bytes():
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                raise ProviderAPIError(
+                    f"视频接口响应过大，已超过安全限制 {max_bytes} 字节"
+                )
+            chunks.append(chunk)
+
+        return b"".join(chunks)
 
     def _parse_response_text(self, raw_text: str) -> dict[str, Any]:
         raw_text = raw_text.strip()
@@ -108,7 +134,9 @@ class OpenAIVideoClient:
         sse_objects = self._parse_sse_lines(raw_text)
         if sse_objects:
             merged_text = "\n".join(
-                item for item in (self._extract_text_fragment(obj) for obj in sse_objects) if item
+                item
+                for item in (self._extract_text_fragment(obj) for obj in sse_objects)
+                if item
             )
             extracted = self._extract_video_info_from_objects(sse_objects)
             if merged_text and "text" not in extracted:

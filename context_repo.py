@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
+
+import aiofiles
 
 
 class ContextRepo:
@@ -10,8 +13,9 @@ class ContextRepo:
         self.base_dir = base_dir
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.max_messages = max(1, int(max_messages))
+        self._lock = asyncio.Lock()
 
-    def add_message(
+    async def add_message(
         self,
         session_id: str,
         *,
@@ -21,7 +25,7 @@ class ContextRepo:
         is_bot: bool = False,
     ) -> None:
         path = self._get_session_path(session_id)
-        data = self._load_json(path)
+        data = await self._load_json(path)
         messages = list(data.get("messages", []))
 
         messages.append(
@@ -37,19 +41,23 @@ class ContextRepo:
         if len(messages) > self.max_messages:
             messages = messages[-self.max_messages :]
 
-        self._save_json(path, {"messages": messages})
+        await self._save_json(path, {"messages": messages})
 
-    def get_recent_messages(self, session_id: str, count: int = 6) -> list[dict[str, Any]]:
+    async def get_recent_messages(
+        self,
+        session_id: str,
+        count: int = 6,
+    ) -> list[dict[str, Any]]:
         path = self._get_session_path(session_id)
-        data = self._load_json(path)
+        data = await self._load_json(path)
         messages = list(data.get("messages", []))
         count = max(0, int(count))
         if count == 0:
             return []
         return messages[-count:]
 
-    def build_context_text(self, session_id: str, count: int = 6) -> str:
-        messages = self.get_recent_messages(session_id, count=count)
+    async def build_context_text(self, session_id: str, count: int = 6) -> str:
+        messages = await self.get_recent_messages(session_id, count=count)
         if not messages:
             return ""
 
@@ -62,26 +70,31 @@ class ContextRepo:
 
         return "\n".join(lines)
 
-    def clear_session(self, session_id: str) -> None:
+    async def clear_session(self, session_id: str) -> None:
         path = self._get_session_path(session_id)
         if path.exists():
-            path.unlink()
+            async with self._lock:
+                if path.exists():
+                    path.unlink()
 
     def _get_session_path(self, session_id: str) -> Path:
         safe_name = session_id.replace(":", "_").replace("/", "_").replace("\\", "_")
         return self.base_dir / f"{safe_name}.json"
 
-    def _load_json(self, path: Path) -> dict[str, Any]:
+    async def _load_json(self, path: Path) -> dict[str, Any]:
         if not path.exists():
             return {}
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            return raw if isinstance(raw, dict) else {}
+            async with self._lock:
+                async with aiofiles.open(path, "r", encoding="utf-8") as file:
+                    raw = await file.read()
+            payload = json.loads(raw)
+            return payload if isinstance(payload, dict) else {}
         except Exception:
             return {}
 
-    def _save_json(self, path: Path, data: dict[str, Any]) -> None:
-        path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+    async def _save_json(self, path: Path, data: dict[str, Any]) -> None:
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+        async with self._lock:
+            async with aiofiles.open(path, "w", encoding="utf-8") as file:
+                await file.write(payload)
